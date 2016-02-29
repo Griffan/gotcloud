@@ -21,17 +21,16 @@ typedef std::vector<RECORD> MATE_VECTOR;
 
 class Bam2FastQ;
 
-struct
-{
-  bool operator() (const RECORD& lhs, const RECORD&rhs) const
-  {
-    return (lhs.first > rhs.first);//sort it descendingly, because heap pop out the max
-  }
-}RecordComparison;
+struct {
+	bool operator()(const RECORD& lhs, const RECORD&rhs) const {
+		return (lhs.first > rhs.first); //sort it descendingly, because heap pop out the max
+	}
+} RecordComparison;
 
 class MateVectorByRN {
 public:
-	MateVectorByRN(int vectorIndex, Bam2FastQ* host, std::string  chr, long begin, long end);
+	MateVectorByRN(int vectorIndex, Bam2FastQ* host, std::string chr,
+			long begin, long end);
 	MateVectorByRN();
 	virtual ~MateVectorByRN();
 
@@ -40,6 +39,8 @@ public:
 	//SamRecord* GetMate(SamRecord& record);
 
 	int Read(const std::string& bamFile);
+
+	bool IsInTheRegion(SamRecord* record);
 
 	//SamRecord* SetRecordFromBamT(bam1_t * buffer);
 	/// Add the specified record to this mate vector
@@ -54,7 +55,9 @@ public:
 	//clear buffer, reset shrink_limit
 	void ClearWorkingBuffer();
 
-	inline void FlipWorkingBuffer(){bufferInUse=1-bufferInUse;}
+	inline void FlipWorkingBuffer() {
+		bufferInUse = 1 - bufferInUse;
+	}
 
 	void clearMyPool();
 
@@ -80,10 +83,10 @@ public:
 
 	int vectorIndex;
 
-    SamRecord* prevRec;
+	SamRecord* prevRec;
 
-    std::string prevRN;
-    SamRecordPool* myPool;
+	std::string prevRN;
+	SamRecordPool* myPool;
 
 	std::string tmpFileName;
 	std::string tmpFileNameBase;
@@ -96,7 +99,7 @@ public:
 	std::string SecondFileNameExt;
 	std::string UnpairedFileNameExt;
 
-	Bam2FastQ* host;//interface to final output
+	Bam2FastQ* host;	//interface to final output
 private:
 };
 
