@@ -53,6 +53,7 @@ GenMatrixBinary::GenMatrixBinary(const char* vcfFile, bool siteOnly, std::vector
     bytesPerMarker = (indids.size() + 3)/4;
   }
 
+  int numNonAutoWarn = 0;
   // read each marker and stores genotype
   while( vcf.iterateMarker() ) {
     // set per-marker level information
@@ -61,6 +62,15 @@ GenMatrixBinary::GenMatrixBinary(const char* vcfFile, bool siteOnly, std::vector
     }
 
     pMarker = vcf.getLastMarker();
+
+    // Non-autosomal chromosomes must be discarded
+    if ( !VcfHelper::isAutosome(pMarker->sChrom.c_str()) ) {
+        if(++numNonAutoWarn <= 5)
+        {
+            Logger::gLogger->warning("Skipping no-autosomal marker %s:%d",pMarker->sChrom.c_str(),pMarker->nPos);
+        }
+        continue;
+    }    
 
     // get allele frequency information from VCF file
     // if site-only is set
@@ -257,6 +267,10 @@ void VerifyBamID::loadFiles(const char* bamFile, const char* vcfFile) {
 
   const char* smID = pArgs->sSMID.IsEmpty() ? NULL : pArgs->sSMID.c_str();
 
+  if ( pArgs->bNoEOF ) {
+    BgzfFileType::setRequireEofBlock(false);
+  }
+
   pPile = new BamPileBases(bamFile, smID, pArgs->bIgnoreRG);
   pPile->minMapQ = pArgs->minMapQ;
   pPile->maxDepth = pArgs->maxDepth;
@@ -265,10 +279,6 @@ void VerifyBamID::loadFiles(const char* bamFile, const char* vcfFile) {
   pPile->includeSamFlag = pArgs->includeSamFlag;
   pPile->excludeSamFlag = pArgs->excludeSamFlag;
   //pPile->bIgnoreRG = pArgs->bIgnoreRG;
-
-  if ( pArgs->bNoEOF ) {
-    BgzfFileType::setRequireEofBlock(false);
-  }
 
   // set # of readGroups when loading BAMs
   nRGs = (int)pPile->vsRGIDs.size();

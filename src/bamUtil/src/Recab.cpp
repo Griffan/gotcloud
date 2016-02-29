@@ -1,5 +1,5 @@
 /*
- *  Copyright (C) 2010-2012  Christian Fuchsberger,
+ *  Copyright (C) 2010-2015  Christian Fuchsberger,
  *                           Regents of the University of Michigan
  *
  *   This program is free software: you can redistribute it and/or modify
@@ -66,6 +66,7 @@ Recab::Recab()
     myNumQualTagErrors = 0;
     myNumDBSnpSkips = 0;
     mySubMinQual = 0;
+    myAmbiguous = 0;
     myBMatchCount = 0;
     myBMismatchCount = 0;
     myBasecounts = 0;
@@ -78,6 +79,7 @@ Recab::Recab()
     myLogReg = false;
     myMinBaseQual = DEFAULT_MIN_BASE_QUAL;
     myMaxBaseQual = DEFAULT_MAX_BASE_QUAL;
+    myMaxBaseQualChar = BaseUtilities::getAsciiQuality(DEFAULT_MAX_BASE_QUAL);
 }
 
 
@@ -119,7 +121,8 @@ void Recab::usage()
 
 void Recab::recabSpecificUsageLine()
 {
-    std::cerr << "--refFile <ReferenceFile> [--dbsnp <dbsnpFile>] [--minBaseQual <minBaseQual>] [--maxBaseQual <maxBaseQual>] [--blended <weight>] [--fitModel] [--fast] [--keepPrevDbsnp] [--keepPrevNonAdjacent] [--useLogReg] [--qualField <tag>] [--storeQualTag <tag>] [--buildExcludeFlags <flag>] [--applyExcludeFlags <flag>]";
+    std::cerr << "--refFile <ReferenceFile> [--dbsnp <dbsnpFile>] [--minBaseQual <minBaseQual>] [--maxBaseQual <maxBaseQual>] [--blended <weight>] [--fitModel] [--fast] [--keepPrevDbsnp] [--keepPrevNonAdjacent] [--useLogReg] [--qualField <tag>] [--storeQualTag <tag>] [--buildExcludeFlags <flag>] [--applyExcludeFlags <flag>] ";
+    mySqueeze.binningUsageLine();
 }
 
 void Recab::recabSpecificUsage()
@@ -130,6 +133,8 @@ void Recab::recabSpecificUsage()
     std::cerr << "\t--dbsnp <known variance file> : dbsnp file of positions" << std::endl;
     std::cerr << "\t--minBaseQual <minBaseQual>   : minimum base quality of bases to recalibrate (default: " << DEFAULT_MIN_BASE_QUAL << ")" << std::endl;
     std::cerr << "\t--maxBaseQual <maxBaseQual>   : maximum recalibrated base quality (default: " << DEFAULT_MAX_BASE_QUAL << ")" << std::endl;
+    std::cerr << "\t                                qualities over this value will be set to this value." << std::endl;
+    std::cerr << "\t                                This setting is applied after binning (if applicable)." << std::endl;
     std::cerr << "\t--blended <weight>            : blended model weight" << std::endl;
     std::cerr << "\t--fitModel                    : check if the logistic regression model fits the data" << std::endl;
     std::cerr << "\t                                overriden by fast, but automatically applied by useLogReg" << std::endl;
@@ -153,6 +158,7 @@ void Recab::recabSpecificUsage()
     std::cerr << "\t--buildExcludeFlags <flag>    : exclude reads with any of these flags set when building the" << std::endl;
     std::cerr << "\t                                recalibration table" << std::endl;
     std::cerr << "\t--applyExcludeFlags <flag>    : do not apply the recalibration table to any reads with any of these flags set" << std::endl;
+    mySqueeze.binningUsage();
 }
 
 
@@ -211,12 +217,11 @@ int Recab::execute(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    if(myRefFile.IsEmpty())
+    int status = processRecabParam();
+    if(status != 0)
     {
-        usage();
         inputParameters.Status();
-        std::cerr << "Missing required --refFile parameter" << std::endl;
-        return EXIT_FAILURE;
+        return(status);
     }
 
     if ( logFile.IsEmpty() )
@@ -277,7 +282,15 @@ int Recab::execute(int argc, char *argv[])
     localtm = localtime(&now);
     Logger::gLogger->writeLog("End: %s", asctime(localtm));
 
-    modelFitPrediction(outFile);
+    if((outFile[0] == '-') && (logFile[0] != '-'))
+    {
+        // Since outFile is to stdout, and logfile isn't, pass logfile name 
+        modelFitPrediction(logFile);
+    }
+    else
+    {
+        modelFitPrediction(outFile);
+    }
 
     Logger::gLogger->writeLog("Writing recalibrated file %s",outFile.c_str());
 
@@ -322,6 +335,21 @@ void Recab::addRecabSpecificParameters(LongParamContainer& params)
     params.addString("buildExcludeFlags", &myBuildExcludeFlags);
     params.addString("applyExcludeFlags", &myApplyExcludeFlags);
     myParamsSetup = false;
+    mySqueeze.addBinningParameters(params);
+
+}
+
+
+int Recab::processRecabParam()
+{
+    if(myRefFile.IsEmpty())
+    {
+        std::cerr << "Missing required --refFile parameter" << std::endl;
+        return EXIT_FAILURE;
+    }
+    myMaxBaseQualChar = BaseUtilities::getAsciiQuality(myMaxBaseQual);
+
+    return(mySqueeze.processBinningParam());
 }
 
 
@@ -580,7 +608,14 @@ bool Recab::processReadBuildTable(SamRecord& samRecord)
 
         // Set the reference & read bases in the Covariates
         char refBase = (*myReferenceGenome)[refPos];
-        
+
+        if(BaseUtilities::isAmbiguous(refBase))
+        {
+            // N reference, so skip it when building the table.
+            ++myAmbiguous;
+            continue;
+        }
+
         if(reverse)
         {
             refBase = BaseAsciiMap::base2complement[(unsigned int)(refBase)];
@@ -730,11 +765,12 @@ bool Recab::processReadApplyTable(SamRecord& samRecord)
 
         // Update quality score
         uint8_t qemp = hasherrormodel.getQemp(data);
-        if(qemp > myMaxBaseQual)
+        qemp = mySqueeze.getQualCharFromQemp(qemp);
+        if(qemp > myMaxBaseQualChar)
         {
-            qemp = myMaxBaseQual;
+            qemp = myMaxBaseQualChar;
         }
-        myQualityStrings.newq[seqPos] = qemp+33;
+        myQualityStrings.newq[seqPos] = qemp;
     }
 
     if(!myStoreQualTag.IsEmpty())
@@ -761,8 +797,8 @@ void Recab::modelFitPrediction(const char* outputBase)
 
     Logger::gLogger->writeLog("# Bases observed: %ld - #match: %ld; #mismatch: %ld",
                               myBasecounts, myBMatchCount, myBMismatchCount);
-    Logger::gLogger->writeLog("# Bases Skipped for DBSNP: %ld, for BaseQual < %ld: %ld", 
-                              myNumDBSnpSkips, myMinBaseQual, mySubMinQual);
+    Logger::gLogger->writeLog("# Bases Skipped for DBSNP: %ld, for BaseQual < %ld: %ld, ref 'N': %ld", 
+                              myNumDBSnpSkips, myMinBaseQual, mySubMinQual, myAmbiguous);
     if(myNumQualTagErrors != 0)
     {
         Logger::gLogger->warning("%ld records did not have tag %s or it was invalid, so the quality field was used for those records.", myNumQualTagErrors, myQField.c_str());
@@ -775,31 +811,41 @@ void Recab::modelFitPrediction(const char* outputBase)
         //// Model fitting + prediction
         std::string modelfile = outputBase;
         modelfile += ".model";
+        if(outputBase[0] == '-')
+        {
+            modelfile = "";
+        }
         
         prediction.setErrorModel(&(hasherrormodel));
         
         Logger::gLogger->writeLog("Start model fitting!");
-        if(prediction.fitModel(true,modelfile))
-            prediction.outModel();
-        else
+        if(!prediction.fitModel(true,modelfile))
+        {
             Logger::gLogger->error("Could not fit model!");
+        }
         
         hasherrormodel.addPrediction(prediction.getModel(),myBlendedWeight);
 
-        std::string recabFile = outputBase;
-        recabFile += ".recab";
-        Logger::gLogger->writeLog("Writing recalibration table %s",recabFile.c_str());
-        if(!(hasherrormodel.writeTableQemp(recabFile,
-                                           myId2Rg, true)))
-            Logger::gLogger->error("Writing errormodel not possible!");
+        if(outputBase[0] != '-')
+        {
+            std::string recabFile = outputBase;
+            recabFile += ".recab";
+            Logger::gLogger->writeLog("Writing recalibration table %s",recabFile.c_str());
+            if(!(hasherrormodel.writeTableQemp(recabFile,
+                                               myId2Rg, true)))
+                Logger::gLogger->error("Writing errormodel not possible!");
+        }
     }
 
-    std::string qempFile = outputBase;
-    qempFile += ".qemp";
-    Logger::gLogger->writeLog("Writing recalibration table %s",qempFile.c_str());
-    if(!(hasherrormodel.writeTableQemp(qempFile,
-                                       myId2Rg, false)))
-        Logger::gLogger->error("Writing errormodel not possible!");
+    if(outputBase[0] != '-')
+    {
+        std::string qempFile = outputBase;
+        qempFile += ".qemp";
+        Logger::gLogger->writeLog("Writing recalibration table %s",qempFile.c_str());
+        if(!(hasherrormodel.writeTableQemp(qempFile,
+                                           myId2Rg, false)))
+            Logger::gLogger->error("Writing errormodel not possible!");
+    }
 }
 
 

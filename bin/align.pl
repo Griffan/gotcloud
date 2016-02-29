@@ -73,6 +73,7 @@ my %opts = (
     conf => '',
     verbose => 0,
     maxlocaljobs => 10,
+    override => '',
 );
 Getopt::Long::GetOptions( \%opts,qw(
     help
@@ -89,12 +90,14 @@ Getopt::Long::GetOptions( \%opts,qw(
     base_prefix|baseprefix=s
     keeptmp
     keeplog
+    cram
     noPhoneHome
     verbose=i
     threads=i
     numjobs=i
     numcs=i
     maxlocaljobs=i
+    override=s
     gotcloudroot|gcroot=s
 )) || die "Failed to parse options\n";
 
@@ -151,9 +154,10 @@ push(@confSettings, "GOTCLOUD_ROOT = $gotcloudRoot");
 #--------------------------------------------------------------
 #   Special case for convenient testing
 if ($opts {test}) {
-    # remove a trailing slash if there is one.
-    $opts{test} =~ s/\/\z//;
+    # remove any trailing slashes.
+    $opts{test} =~ s/\/+\z//;
     my $outdir=abs_path($opts{test});
+    die "Parent directory of $opts{test} should exist." if ! defined($outdir);
     system("mkdir -p $outdir") &&
         die "Unable to create directory '$outdir'\n";
     my $testoutdir = $outdir . '/aligntest';
@@ -214,8 +218,8 @@ if ($opts{conf})
 #   Set configuration variables from comand line options
 #############################################################################
 if ($opts{out_dir}) {
-    # remove a trailing slash if there is one.
-    $opts{out_dir} =~ s/\/\z//;
+    # remove any trailing slashes.
+    $opts{out_dir} =~ s/\/+\z//;
     my $outdir = abs_path($opts{out_dir});
     system("mkdir -p $outdir") &&
         die "Unable to create directory '$outdir'\n";
@@ -235,9 +239,13 @@ if ($opts{fastq_prefix}) { push(@confSettings, "FASTQ_PREFIX = $opts{fastq_prefi
 if ($opts{base_prefix})  { push(@confSettings, "BASE_PREFIX = $opts{base_prefix}"); }
 if ($opts{keeptmp})      { push(@confSettings, "KEEP_TMP = $opts{keeptmp}"); }
 if ($opts{keeplog})      { push(@confSettings, "KEEP_LOG = $opts{keeplog}"); }
+if (exists $opts{cram})  { push(@confSettings, "ALIGN_CRAM_OUTPUT = TRUE"); }
 if ($opts{list})         { push(@confSettings, "FASTQ_LIST = $opts{list}"); }
 if ($opts{batchtype})    { push(@confSettings, "BATCH_TYPE = $opts{batchtype}"); }
 if ($opts{batchopts})    { push(@confSettings, "BATCH_OPTS = $opts{batchopts}"); }
+
+# Process the override flags.
+push(@confSettings, split(";", $opts{override}));
 
 #############################################################################
 #   Load configuration variables from conf file
@@ -249,6 +257,12 @@ if (loadConf(\@confSettings, \@configs, $opts{verbose})) {
 }
 
 my @perMergeStep = split(' ', getConf("PER_MERGE_STEPS"));
+my @cramSteps = split(' ', getConf("ALIGN_CRAM_OUTPUT_STEPS"));
+my @allSteps = @perMergeStep;
+if(uc(getConf("ALIGN_CRAM_OUTPUT")) eq "TRUE")
+{
+    push(@allSteps, @cramSteps);
+}
 
 
 if(!getConf("FASTQ_LIST"))
@@ -266,7 +280,7 @@ if(!getConf("FASTQ_LIST"))
 # to the fastq file names.
 foreach my $key (qw(REF_DIR OUT_DIR)) {
     my $f = getConf($key);
-    if (! $f) { die "Required field -$key was not specified\n"; }
+    if (! $f) { die "Required field $key was not specified\n"; }
     #   Extract up to the first '_' from the key to get the prefix type option.
     my $type = substr($key, 0, index($key, '_'));
     #   Replace the already stored value with the absolute path
@@ -276,7 +290,7 @@ foreach my $key (qw(REF_DIR OUT_DIR)) {
 # paths to add base prefix, but not specific type.
 foreach my $key (qw(FASTQ_LIST)) {
     my $f = getConf($key);
-    if (! $f) { die "Required field -$key was not specified\n"; }
+    if (! $f) { die "Required field $key was not specified\n"; }
     #   Replace the already stored value with the absolute path
     setConf($key, getAbsPath($f));
 }
@@ -321,12 +335,18 @@ foreach my $step (@perMergeStep)
 #   Check for the required sub REF files.
 my @mapExtensions;
 my $removeExt = 0;
+my $oneBwa = 0;
+my $prevBwa = "";
 
 # Ensure the map type is in all caps.
 setConf('MAP_TYPE', uc(getConf('MAP_TYPE')));
 
 if ( (getConf('MAP_TYPE') eq 'BWA') || (getConf('MAP_TYPE') eq 'BWA_MEM') ) {
     @mapExtensions = qw(.amb .ann .bwt .pac .sa);
+    if(defined getConf("ONE_BWA") && getConf("ONE_BWA") ne 0 && getConf("ONE_BWA") ne "")
+    {
+        $oneBwa = 1;
+    }
 }
 elsif (getConf('MAP_TYPE') eq 'MOSAIK') {
     @mapExtensions = qw(.dat _15_keys.jmp _15_meta.jmp _15_positions.jmp);
@@ -432,7 +452,7 @@ for my $refType (@reqRefs)
 #----------------------------------------------------------------------------
 #   Check for required executables
 #----------------------------------------------------------------------------
-my @reqExes = qw(SAMTOOLS_EXE BAM_EXE);
+my @reqExes = qw(SAMTOOLS_SORT_EXE SAMTOOLS_EXE BAM_EXE);
 if ( (getConf('MAP_TYPE') eq 'BWA') || (getConf('MAP_TYPE') eq 'BWA_MEM') )
 {
     push(@reqExes, 'BWA_EXE');
@@ -450,7 +470,7 @@ foreach my $exe (@reqExes)
     $missingExe++;
 }
 # Loop through the defined steps & check for required exes.
-foreach my $step (@perMergeStep)
+foreach my $step (@allSteps)
 {
     my $exes = getConf($step."_REQ_EXES");
     if(defined $exes)
@@ -531,12 +551,14 @@ foreach my $key (keys %deprecatedWarn)
 if (getConf('MAP_TYPE') eq 'BWA')
 {
     # Validate BWA_THREADS & BWA_QUAL.
-    my $option = "-[oeidlkmMOERqB] +[0-9]+|-[LNIY]|-n +[0-9]*.?[0-9]+";
-    if(getConf("BWA_QUAL") !~ /^((${option}) +)*-q +[0-9]+( +(${option}))*$/)
+#    my $option = "-[oeidlkmMOERqB] +[0-9]+|-[LNIY]|-n +[0-9]*.?[0-9]+";
+#    if(getConf("BWA_QUAL") !~ /^((${option}) +)*-q +[0-9]+( +(${option}))*$/)
+    if(getConf("BWA_QUAL") !~ /^(.* )*-q +[0-9]+( .*)*$/)
     {
-        die "ERROR: BWA_QUAL is invalid.  Be sure you specified '-q #threads', ".getConf("BWA_QUAL")."\n";
+        die "ERROR: BWA_QUAL is invalid.  Be sure you specified '-q trimQual', ".getConf("BWA_QUAL")."\n";
     }
-    if(getConf("BWA_THREADS") !~ /^((${option}) +)*-t +[0-9]+( +(${option}))*$/)
+#    if(getConf("BWA_THREADS") !~ /^((${option}) +)*-t +[0-9]+( +(${option}))*$/)
+    if(getConf("BWA_THREADS") !~ /^(.* )*-t +[0-9]+( .*)*$/)
     {
         die "ERROR: BWA_THREADS is invalid.  Be sure you specified '-t #threads', ".getConf("BWA_THREADS")."\n";
     }
@@ -544,8 +566,7 @@ if (getConf('MAP_TYPE') eq 'BWA')
 elsif(getConf('MAP_TYPE') eq 'BWA_MEM')
 {
     # Validate BWA_THREADS
-    my $option = "-[kwdcABOELUvT] +[0-9]+|-[SPpaC]|-r +[0-9]*.?[0-9]+";
-    if(getConf("BWA_THREADS") !~ /^((${option}) +)*-t +[0-9]+( +(${option}))*$/)
+    if(getConf("BWA_THREADS") !~ /^(.* )*-t +[0-9]+( .*)*$/)
     {
         die "ERROR: BWA_THREADS is invalid.  Be sure you specified '-t #threads', ".getConf("BWA_THREADS")."\n";
     }
@@ -603,7 +624,7 @@ if(($numSubs > 0) || ($line =~ m/ \t|\t /))
 }
 
 #   Track positions for each field
-my @fieldnames = qw(MERGE_NAME FASTQ1 FASTQ2 RGID SAMPLE LIBRARY CENTER PLATFORM);
+my @fieldnames = qw(MERGE_NAME FASTQ1 FASTQ2 RGID SAMPLE LIBRARY CENTER PLATFORM RG);
 my %fieldname2index = ();
 foreach my $key (@fieldnames) { $fieldname2index{$key} = undef(); } # Avoid tedious hardcoding
 # There are no spaces in the field names, so split on spaces.
@@ -631,7 +652,7 @@ foreach my $index (0..$#fields)
     $fieldname2index{$field} = $index;
 }
 foreach my $key (qw(FASTQ1)) {       # These are required, other columns could be missing
-    if (! defined($fieldname2index{$key})) { die "Index File, $index_file, is missing required header field, $key\n"; }
+    if (! defined($fieldname2index{$key})) { die "ERROR: Index File, $index_file, is missing required header field, $key\n"; }
 }
 
 # Either MERGE_NAME or SAMPLE are required.
@@ -639,7 +660,7 @@ if(! defined($fieldname2index{MERGE_NAME}))
 {
     if(! defined($fieldname2index{SAMPLE}))
     {
-        die "Index File, $index_file, is missing required header field.  Either 'MERGE_NAME' or 'SAMPLE' is required.\n";
+        die "ERROR: Index File, $index_file, is missing required header field.  Either 'MERGE_NAME' or 'SAMPLE' is required.\n";
     }
     else
     {
@@ -647,17 +668,35 @@ if(! defined($fieldname2index{MERGE_NAME}))
     }
 }
 
+# if RG is specified:
+#    1) it must be the last field
+#    2) RGID, LIBRARY, CENTER, and PLATFORM must not be specified
+if(defined($fieldname2index{RG}))
+{
+    if($fieldname2index{RG} != $#fields)
+    {
+        die "ERROR: RG must be the last field in $index_file\n";
+    }
+    if(defined($fieldname2index{RGID}) || defined($fieldname2index{SAMPLE}) || defined($fieldname2index{LIBRARY}) ||
+       defined($fieldname2index{CENTER}) || defined($fieldname2index{PLATFORM}))
+    {
+        die "ERROR: in $index_file, if RG is specified, RGID, LIBRARY, CENTER, and PLATFORM can't be specified.\n";
+    }
+}
+
+
 
 
 #----------------------------------------------------------------------------
 #   Read the rest of the file
 #----------------------------------------------------------------------------
 my %fq1toFq2 = ();
-my %fq1toRg = ();
+my %fq1toRGID = ();
 my %fq1toSm = ();
 my %fq1toLib = ();
 my %fq1toCn = ();
 my %fq1toPl = ();
+my %fq1toRG = ();
 my %mergeToFq1 = ();
 my %smToMerge = ();
 my $numBlanks = 0;
@@ -691,12 +730,19 @@ while ($line = <IN>)
     {
         $field =~ s/^\s+|\s+$//g;
     }
-    if($numHeaderFields != scalar @fields)
+    # Check for number of fields if RG is not specified.
+    if(!defined($fieldname2index{RG}) && ($numHeaderFields != scalar @fields))
     {
         die "\nERROR, incorrect number of fields in $index_file, ".scalar @fields.
         " fields instead of the $numHeaderFields fields found in the header line:\n\t".
         join("\n\t",@fields).
         "\nRemember, tabs are the delimiter and leading/trailing white spaces are trimmed\n\n";
+    }
+    # If RG is specified, verify the value at the RG index is @RG.
+    if(defined($fieldname2index{RG}) && ($fields[$fieldname2index{RG}] ne "\@RG"))
+    {
+        die "\nERROR: \"\@RG\" is not in the \"RG\" column of $index_file\n".
+        "$fields[$fieldname2index{RG}] was found instead.\n";
     }
 
     my $fastq1 = $fields[$fieldname2index{FASTQ1}];
@@ -718,78 +764,128 @@ while ($line = <IN>)
     if (defined($fieldname2index{FASTQ2}))   { $fq1toFq2{$fastq1} = $fields[$fieldname2index{FASTQ2}]; }
     else { $fq1toFq2{$fastq1} = '.'; }
 
-    if (defined($fieldname2index{RGID}))     { $fq1toRg{$fastq1} = $fields[$fieldname2index{RGID}]; }
-    else
+    if(!defined($fieldname2index{RG}))
     {
-        # RG not in header.
-        # Read the first line of the FASTQ to try to determine the RG
-        my $fullPathFQ1 = getAbsPath($fastq1, 'FASTQ');
-        die "ERROR: Cannot open file $fastq1: $!\n" unless ( -s $fullPathFQ1 );
-        tie *FQ1, "IO::Zlib", $fullPathFQ1, "rb";
-        my $fqline = FQ1->getline();
-
-        # Check if first line of fastq1 matches expected default format:
-        if($fqline =~ m/^@([^:]*:[^:]*:[^:]*:[^:]*)/)
+        # whole RG line wasn't specified, so check for each field.
+        if (defined($fieldname2index{RGID}))     { $fq1toRGID{$fastq1} = $fields[$fieldname2index{RGID}]; }
+        else
         {
-            if(!exists $warn{RGID1})
+            # RG not in header.
+            # Read the first line of the FASTQ to try to determine the RG
+            my $fullPathFQ1 = getAbsPath($fastq1, 'FASTQ');
+            die "ERROR: Cannot open file $fastq1: $!\n" unless ( -s $fullPathFQ1 );
+            tie *FQ1, "IO::Zlib", $fullPathFQ1, "rb";
+            my $fqline = FQ1->getline();
+            close(FQ1);
+            # Check if first line of fastq1 matches expected default format:
+            if($fqline =~ m/^@([^:]*:[^:]*:[^:]*:[^:]*)/)
+            {
+                if(!exists $warn{RGID1})
+                {
+                    ++$numInfer;
+                    warn "WARNING: RGID was not specified, so defaulting to the first 4 fields (':' delimited) of the first FASTQ1 sequence identifier.\n";
+                    $warn{RGID1} = 1;
+                }
+                $fq1toRGID{$fastq1} = $1;
+            }
+            else
+            {
+                # Unable to determine readgroup, default to fastq name.
+                if(!exists $warn{RGID2})
+                {
+                    ++$numInfer;
+                    warn "WARNING: RGID was not specified, so defaulting to incrementing numbers.\n";
+                    $warn{RGID2} = 1;
+                }
+                $fq1toRGID{$fastq1} = $rgNum++;
+            }
+        }
+
+        if (defined($fieldname2index{SAMPLE}))   { $fq1toSm{$fastq1} = $fields[$fieldname2index{SAMPLE}]; }
+        else { $fq1toSm{$fastq1} = $mergeName; }
+
+        if (defined($fieldname2index{LIBRARY}))  { $fq1toLib{$fastq1} = $fields[$fieldname2index{LIBRARY}]; }
+        else
+        {
+            if(!exists $warn{LIBRARY})
             {
                 ++$numInfer;
-                warn "WARNING: RGID was not specified, so defaulting to the first 4 fields (':' delimited) of the first FASTQ1 sequence identifier.\n";
-                $warn{RGID1} = 1;
+                warn "WARNING: LIBRARY was not specified, so defaulting to the value of SAMPLE.\n";
+                $warn{LIBRARY} = 1;
             }
-            $fq1toRg{$fastq1} = $1;
+            $fq1toLib{$fastq1} = $fq1toSm{$fastq1};
+        }
+
+        if (defined($fieldname2index{CENTER}))   { $fq1toCn{$fastq1} = $fields[$fieldname2index{CENTER}]; }
+        else
+        {
+            if(!exists $warn{CENTER})
+            {
+                ++$numInfer;
+                warn "WARNING: CENTER was not specified, so defaulting to 'unknown'.\n";
+                $warn{CENTER} = 1;
+            }
+            $fq1toCn{$fastq1} = 'unknown';
+        }
+
+        if (defined($fieldname2index{PLATFORM})) { $fq1toPl{$fastq1} = $fields[$fieldname2index{PLATFORM}]; }
+        else
+        {
+            if(!exists $warn{PLATFORM})
+            {
+                ++$numInfer;
+                warn "WARNING: PLATFORM was not specified, so defaulting to 'ILLUMINA'.\n";
+                $warn{PLATFORM} = 1;
+            }
+            $fq1toPl{$fastq1} = 'ILLUMINA';
+        }
+    }
+    else
+    {
+        # Use RG line
+        $fq1toRG{$fastq1} = "\"".join('\t',@fields[$fieldname2index{RG}..$#fields])."\"";
+        # Set other values.
+        if($fq1toRG{$fastq1} =~ /SM:([^\\"]*)/)
+        {
+            $fq1toSm{$fastq1} = $1;
         }
         else
         {
-            # Unable to determine readgroup, default to fastq name.
-            if(!exists $warn{RGID2})
-            {
-                ++$numInfer;
-                warn "WARNING: RGID was not specified, so defaulting to incrementing numbers.\n";
-                $warn{RGID2} = 1;
-            }
-            $fq1toRg{$fastq1} = $rgNum++;
+            $fq1toSm{$fastq1} = $mergeName;
         }
-    }
-
-    if (defined($fieldname2index{SAMPLE}))   { $fq1toSm{$fastq1} = $fields[$fieldname2index{SAMPLE}]; }
-    else { $fq1toSm{$fastq1} = $mergeName; }
-
-    if (defined($fieldname2index{LIBRARY}))  { $fq1toLib{$fastq1} = $fields[$fieldname2index{LIBRARY}]; }
-    else
-    {
-        if(!exists $warn{LIBRARY})
+        if($fq1toRG{$fastq1} =~ /ID:([^\t ]*)/)
         {
-            ++$numInfer;
-            warn "WARNING: LIBRARY was not specified, so defaulting to the value of SAMPLE.\n";
-            $warn{LIBRARY} = 1;
+            $fq1toRGID{$fastq1} = $1;
         }
-        $fq1toLib{$fastq1} = $fq1toSm{$fastq1};
-    }
-
-    if (defined($fieldname2index{CENTER}))   { $fq1toCn{$fastq1} = $fields[$fieldname2index{CENTER}]; }
-    else
-    {
-        if(!exists $warn{CENTER})
+        else
         {
-            ++$numInfer;
-            warn "WARNING: CENTER was not specified, so defaulting to 'unknown'.\n";
-            $warn{CENTER} = 1;
+            $fq1toRGID{$fastq1} = ".";
         }
-        $fq1toCn{$fastq1} = 'unknown';
-    }
-
-    if (defined($fieldname2index{PLATFORM})) { $fq1toPl{$fastq1} = $fields[$fieldname2index{PLATFORM}]; }
-    else
-    {
-        if(!exists $warn{PLATFORM})
+        if($fq1toRG{$fastq1} =~ /LB:([^\t ]*)/)
         {
-            ++$numInfer;
-            warn "WARNING: PLATFORM was not specified, so defaulting to 'ILLUMINA'.\n";
-            $warn{PLATFORM} = 1;
+            $fq1toLib{$fastq1} = $1;
         }
-        $fq1toPl{$fastq1} = 'ILLUMINA';
-    }
+        else
+        {
+            $fq1toLib{$fastq1} = ".";
+        }
+        if($fq1toRG{$fastq1} =~ /CN:([^\t ]*)/)
+        {
+            $fq1toCn{$fastq1} = $1;
+        }
+        else
+        {
+            $fq1toCn{$fastq1} = ".";
+        }
+         if($fq1toRG{$fastq1} =~ /PL:([^\t ]*)/)
+        {
+            $fq1toPl{$fastq1} = $1;
+        }
+        else
+        {
+            $fq1toPl{$fastq1} = ".";
+        }
+   }
 
     # Update the list of per sample bams if this is the first
     # appearance of the merge name (mergeToFQ1 has length 1)
@@ -838,7 +934,22 @@ if($numInfer > 0)
     # Inferred some values, so output the index used.
     my $outFastqList = "$out_dir/Makefiles/fastq.list";
     open(OUT,"> ".($outFastqList || '-')) || die "Cannot open $outFastqList for writing.  $!\n";
-    print OUT join("\t",@fieldnames);
+    my $firstField = 1;
+    foreach my $field (@fieldnames)
+    {
+        # Skip RG field since inferred fields mean that RG was not in the original header.
+        next if($field eq "RG");
+
+        if($firstField != 1)
+        {
+            print OUT "\t";
+        }
+        else
+        {
+            $firstField = 0;
+        }
+        print OUT $field;
+    }
     foreach my $mergeName (sort (keys %mergeToFq1))
     {
         foreach my $fastq1 (@{$mergeToFq1{$mergeName}})
@@ -861,7 +972,7 @@ if($numInfer > 0)
                 }
                 elsif($field eq "RGID")
                 {
-                    $val = $fq1toRg{$fastq1};
+                    $val = $fq1toRGID{$fastq1};
                 }
                 elsif($field eq "SAMPLE")
                 {
@@ -878,6 +989,11 @@ if($numInfer > 0)
                 elsif($field eq "PLATFORM")
                 {
                     $val = $fq1toPl{$fastq1};
+                }
+                elsif($field eq "RG")
+                {
+                    # Do not output RG.  Fields are inferred, meaning RG was not used.
+                    next;
                 }
                 else
                 {
@@ -901,13 +1017,19 @@ if(getConf('BAM_INDEX') || getConf('BAM_LIST'))
         $bamIndex = getConf("BAM_LIST");
     }
     open(BAM_IDX,">$bamIndex") || die "Cannot open $bamIndex for writing.  $!\n";
+
+    my $ext = getConf("recab_EXT");
+    if(uc(getConf("ALIGN_CRAM_OUTPUT")) eq "TRUE")
+    {
+        $ext = getConf("cram_EXT");
+    }
     # Loop through %smToMerge and print the bam index
     foreach my $key (keys %smToMerge )
     {
         print BAM_IDX "$key";
         foreach (@{$smToMerge{$key}})
         {
-            print BAM_IDX "\t".&getConf("FINAL_BAM_DIR")."/".$_.".recal.bam";
+            print BAM_IDX "\t".&getConf("FINAL_BAM_DIR")."/".$_.".$ext";
         }
         print BAM_IDX "\n";
     }
@@ -925,7 +1047,7 @@ if ($opts{numjobs} && ($opts{numjobs} > (scalar keys(%smToMerge))))
 #   Done reading the index file, now process each merge file separately.
 #############################################################################
 my %mkcmds = ();
-my ($fastq1, $fastq2, $rgCommand, $saiFiles, $allPolish, $allSteps, $alnFiles, $polFiles);
+my ($saiFiles, $allPolish, $allSteps, $alnFiles, $polFiles);
 foreach my $tmpmerge (sort (keys %mergeToFq1)) {
     my $mergeName = $tmpmerge;
     #   Reset generic variables
@@ -934,6 +1056,7 @@ foreach my $tmpmerge (sort (keys %mergeToFq1)) {
     $saiFiles = '';
     $alnFiles = '';
     $polFiles = '';
+    $prevBwa = '';
 
     #----------------------------------------------------------------------------
     #   Create Makefile for this mergeFile
@@ -949,12 +1072,16 @@ foreach my $tmpmerge (sort (keys %mergeToFq1)) {
 
     #   Start
     print MAK "all: \$(OUT_DIR)/$mergeName.OK\n\n";
-    print MAK "\$(OUT_DIR)/$mergeName.OK: " . getConf('FINAL_BAM_DIR') . "/$mergeName.recal.bam.done " .
-        getConf('QC_DIR') . "/$mergeName.genoCheck.done " . getConf('QC_DIR') . "/$mergeName.qplot.done\n";
+    print MAK "\$(OUT_DIR)/$mergeName.OK:";
+    foreach my $step (@allSteps)
+    {
+        print MAK " ".getConf($step."_DIR") . "/$mergeName." . getConf($step."_EXT",1).".done";
+    }
+    print MAK "\n";
     print MAK doneTarget();
 
     # Loop through the defined steps.
-    foreach my $step (@perMergeStep)
+    foreach my $step (@allSteps)
     {
         print MAK getConf($step."_DIR") . "/$mergeName." . getConf($step."_EXT",1).".done:";
 
@@ -981,34 +1108,42 @@ foreach my $tmpmerge (sort (keys %mergeToFq1)) {
     foreach my $tmpfastq1 (@{$mergeToFq1{$mergeName}}) {
         my $fastq1 = $tmpfastq1;
         my $fastq2 = $fq1toFq2{$fastq1};
-        my $rgid = $fq1toRg{$fastq1};
+        my $alnOutFile = "";
+
+        my $rgid = $fq1toRGID{$fastq1};
         my $sample = $fq1toSm{$fastq1};
         my $library = $fq1toLib{$fastq1};
         my $center = $fq1toCn{$fastq1};
         my $platform = $fq1toPl{$fastq1};
+        my $rgCommand = "";
 
-        #   If RGID is specified, add the rg line.
-        my $rgCommand = '';
-
-        my $alnOutFile = "";
-        #   Perform Mapping.
-        #   Operate on the fastq pair (or single end if single-ended)
         if ( (getConf('MAP_TYPE') eq 'BWA') ||
-             (getConf('MAP_TYPE') eq 'BWA_MEM') ) {
-            if ($rgid ne ".") {
-                if (getConf('MAP_TYPE') eq 'BWA') { $rgCommand = "-r"; }
-                else { $rgCommand = "-R"; }
-                $rgCommand .= " \"\@RG\\tID:$rgid";
-                $rgCommand .= "\\tSM:$sample";
-                #   Only add the optional rg fields if they are specified
-                if ($library ne ".")  { $rgCommand .= "\\tLB:$library"; }
-                if ($center ne '.')   { $rgCommand .= "\\tCN:$center"; }
-                if ($platform ne '.') { $rgCommand .= "\\tPL:$platform"; }
-                $rgCommand .= '"';
+             (getConf('MAP_TYPE') eq 'BWA_MEM') )
+        {
+            if($rgid ne ".")
+            {
+                if (getConf('MAP_TYPE') eq 'BWA') { $rgCommand = "-r "; }
+                else { $rgCommand = "-R "; }
+
+                if(defined $fq1toRG{$fastq1})
+                {
+                    $rgCommand .= $fq1toRG{$fastq1};
+                }
+                else
+                {
+                    $rgCommand .= " \"\@RG\\tID:$rgid";
+                    $rgCommand .= "\\tSM:$sample";
+                    #   Only add the optional rg fields if they are specified
+                    if ($library ne ".")  { $rgCommand .= "\\tLB:$library"; }
+                    if ($center ne '.')   { $rgCommand .= "\\tCN:$center"; }
+                    if ($platform ne '.') { $rgCommand .= "\\tPL:$platform"; }
+                    $rgCommand .= '"';
+                }
             }
             $alnOutFile = mapBwa($fastq1, $fastq2, $rgCommand);
         }
-        elsif (getConf('MAP_TYPE') eq 'MOSAIK') {
+        elsif (getConf('MAP_TYPE') eq 'MOSAIK')
+        {
             if ($rgid ne ".") {
                 $rgCommand = "-id $rgid";
                 $rgCommand .= " -sam $sample";
@@ -1150,6 +1285,13 @@ if ($errs) {
         "  TYPE=".getConf('BATCH_TYPE')."\n" .
         "  OPTS=".getConf('BATCH_OPTS')."\n" .
         "  CMDS=" . join("\n    ", sort(keys %mkcmds)) . "\n";
+
+        if (not open(my $errfile, "$allMakef.err")) {
+            warn "failed to open $allMakef.err";
+        } else {
+            print STDERR <$errfile>;
+            close($errfile);
+        }
 }
 else {
     print STDERR " with no errors reported\n";
@@ -1203,8 +1345,14 @@ sub logCatchFailure {
 sub alignBwa {
     my ($fastq, $sai) = @_;
 
-    my $alnTarget = getConf('SAI_TMP') . '/' . $sai . ".done:\n";
-    $alnTarget .= "\tmkdir -p \$(\@D)\n";
+    my $alnTarget = getConf('SAI_TMP') . '/' . $sai . ".done:";
+    if($oneBwa)
+    {
+        $alnTarget .= "$prevBwa";
+        $prevBwa = getConf('SAI_TMP') . '/' . $sai . ".done";
+    }
+
+    $alnTarget .= "\n\tmkdir -p \$(\@D)\n";
 
     my $alnCmd = getConf('BWA_EXE') . ' aln ' . getConf('BWA_QUAL') . ' ' .
         getConf('BWA_THREADS') . ' ' . getConf('REF') .
@@ -1283,20 +1431,38 @@ sub mapBwa {
     my $finalBwaBam =  getConf('ALN_TMP') . "/$bam.done";
 
     $allSteps .= "$finalBwaBam:";
+    my $rmFastq = getConf("BWA_RM_FASTQ");
+    my $rmStr = "";
+    if(defined $rmFastq && $rmFastq && (uc($rmFastq) ne "FALSE"))
+    {
+        $rmStr = "$absFastq1 $absFastq2";
+    }
 
     if(getConf('MAP_TYPE') eq 'BWA_MEM')
     {
         # No dependencies.
+        if($oneBwa)
+        {
+            # Depend on the previous BWA.
+            $allSteps .= $prevBwa;
+            $prevBwa = $finalBwaBam;
+        }
         $allSteps .= "\n";
         $allSteps .= "\tmkdir -p \$(\@D)\n";
+        my $bwaMemOpts = " " . getConf("BWA_MEM_OPTS");
+        if($bwaMemOpts eq ' ')
+        {
+            $bwaMemOpts = "";
+        }
         # BWA_MEM command.
         my $bwacmd = "(" . getConf('BWA_EXE') . " mem " . getConf("BWA_THREADS") .
+                     "$bwaMemOpts" .
                      " -M $rgCommand " . getConf('REF') . " $absFastq1 $absFastq2 | " .
                      getConf('SAMTOOLS_EXE') . " view -uhS - | " .
-                     getConf('SAMTOOLS_EXE') . " sort -m " . getConf('SORT_MAX_MEM') .
+                     getConf('SAMTOOLS_SORT_EXE') . " sort -m " . getConf('SORT_MAX_MEM') .
                      " - \$(basename \$(basename " . "\$\@))) 2> \$(basename \$\@).log";
         $allSteps .= logCatchFailure("bwa-mem", $bwacmd, "\$(basename \$\@).log");
-        $allSteps .= doneTarget();
+        $allSteps .= doneTarget("", $rmStr);
     }
     else
     {
@@ -1332,11 +1498,11 @@ sub mapBwa {
         my $log = "\$(basename \$(basename \$\@)).$samsesampe.log";
         my $cmd = "(" . getConf('BWA_EXE') . " $samsesampe $rgCommand " . getConf('REF') .
             " \$(basename \$^) $absFastq1 $absFastq2 | " . getConf('SAMTOOLS_EXE') . " view -uhS - | " .
-            getConf('SAMTOOLS_EXE') . " sort -m " . getConf('SORT_MAX_MEM') .
+            getConf('SAMTOOLS_SORT_EXE') . " sort -m " . getConf('SORT_MAX_MEM') .
             " - \$(basename \$(basename " . "\$\@))) 2> $log";
         $allSteps .= logCatchFailure("$samsesampe", $cmd, $log);
 
-        $allSteps .= doneTarget(1);
+        $allSteps .= doneTarget(1, $rmStr);
 
         # Add the aln steps.
         $allSteps .= alignBwa($absFastq1, $sai1);
@@ -1387,7 +1553,7 @@ sub mapMosaik {
     $allSteps .= "\tmkdir -p \$(\@D)\n";
 
     my $sortPrefix = "\$(basename \$(basename \$\@))";
-    my $sortcmd = getConf('SAMTOOLS_EXE') . " sort -m " . getConf('SORT_MAX_MEM') .
+    my $sortcmd = getConf('SAMTOOLS_SORT_EXE') . " sort -m " . getConf('SORT_MAX_MEM') .
         " \$(basename \$^) $sortPrefix 2> $sortPrefix.log";
     $allSteps .= "\t$sortcmd\n";
     $allSteps .= logCatchFailure('sort', "(grep -q -i -e abort -e error -e failed $sortPrefix.log; [ \$\$? -eq 1 ])", "$sortPrefix.log");
@@ -1471,13 +1637,18 @@ sub mapMosaik {
 #   Done with the target, so write the done marker.
 #--------------------------------------------------------------
 sub doneTarget {
-    my ($rmDep) = @_;
+    my ($rmDep, $rmFiles) = @_;
     my $rmTmp = "";
     if((defined($rmDep) && $rmDep) && (!getConf('KEEP_TMP')))
     {
         $rmTmp = "\n\trm -f \$(basename \$^)";
 #        print $rmTmp;
     }
+    if((defined $rmFiles && $rmFiles) && (!getConf('KEEP_TMP')))
+    {
+        $rmTmp .= "\n\trm -f $rmFiles";
+    }
+
 #    return("\t\@echo `date +'%F.%H:%M:%S'` touch \$\@; touch \$\@\n\n");
     return("\t\@echo `date +'%F.%H:%M:%S'` touch \$\@; touch \$\@$rmTmp\n\n");
 }
@@ -1608,6 +1779,10 @@ The default is to remove the log files.
 
 If specified, the temporary files used in this process will not be deleted.
 The default is to remove the temporary files.
+
+=item B<--cram>
+
+Write the final output files in CRAM, removing the intermediate BAM files (default is to have the final output files in BAM).
 
 =item B<--numjobs N>
 

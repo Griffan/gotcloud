@@ -107,7 +107,7 @@ if ($cmd eq 'runcluster-show-details') {
     exit;
 }
 
-if ($opts{bashdir} eq '.') { $_ = `pwd`; chomp($_); $opts{bashdir} = $_; }
+if ($opts{bashdir} eq '.') { $opts{bashdir} = getcwd(); }
 else { mkdir $opts{bashdir}, 0755; }            # If necessary, create directory for jobs
 $opts{jobname} .= $ClusterTypes{$opts{engine}}[0];      # Append i or b to jobname
 
@@ -126,7 +126,7 @@ if ($ClusterTypes{$opts{engine}}[0] eq 'i') {
         die "Unable to create commands to submit to '$opts{engine}' - no jobs started\n";
     }
     #   Run the command, remove any shell scripts we created, exit with correct return code
-    if ($opts{verbose}) { warn "Executing '$opts{engine}' cmd: $runcmd\n"; }
+    if ($opts{verbose}) { warn "Executing interactive job '$opts{engine}' cmd: $runcmd\n"; }
     #   Avoid possible race condition for MOSIX :-(
     #if ($opts{engine} =~ /^mos/) { sleep(1); warn "waiting\n"; }
     my $rc = system($runcmd) >> 8;
@@ -145,7 +145,7 @@ if ($ClusterTypes{$opts{engine}}[0] eq 'b') {
     if ($runcmd =~ /\s+(\S+$opts{autorm_ending})/) { $runshell = $1; }  # Script we are running
 
     #   Run the command, catch the job-id and then wait for it complete
-    if ($opts{verbose}) { warn "Executing '$opts{engine}' cmd: $runcmd\n"; }
+    if ($opts{verbose}) { warn "Executing batch job '$opts{engine}' cmd: $runcmd\n"; }
     my $f = "/tmp/$$.batchlog";
     my $rc = system("$runcmd > $f") >> 8;
     if ($rc) {                              # Unable to submit job
@@ -352,6 +352,8 @@ sub waitforcommand {
     #   query for the batch system and see if the job is still there
     while (1) {
         foreach (1 .. $opts{waittries}) {
+            if ($opts{verbose}) { print "Wait $_\n"; }
+            sleep($opts{waitinterval});
             if (-r "$shell.err") {
                 unlink("$shell.err");
                 if ($opts{verbose}) { print "Found $shell.err\n"; }
@@ -362,14 +364,27 @@ sub waitforcommand {
                 if ($opts{verbose}) { print "Found $shell.ok\n"; }
                 return 0;
             }
-            if ($opts{verbose}) { print "Wait $_\n"; }
-            sleep($opts{waitinterval});
         }
+
+        #check whether the scheduler thinks that the job has completed.
         if ($opts{verbose}) { print "Trying query: $querycmd\n"; }
         my $qout = "/tmp/$$.queryoutput";
         if (system($querycmd . " 2>&1 >$qout") || (-z $qout)) {
+            unlink($qout) or warn "Could not remove $qout\n";
+            # Sleep one more time to give the file system time to catchup.
+            sleep($opts{waitinterval});
+            # Recheck for the err/ok file in case it is there now.
+            if (-r "$shell.err") {
+                unlink("$shell.err");
+                if ($opts{verbose}) { print "Found $shell.err\n"; }
+                return 1;
+            }
+            if (-r "$shell.ok")  {
+                unlink("$shell.ok");
+                if ($opts{verbose}) { print "Found $shell.ok\n"; }
+                return 0;
+            }
             warn "Batch job '$jobid' completed without setting $shell.ok or $shell.err - something is wrong\n";
-            unlink($qout);
             return 99;
         }
         #   Some systems remove q jobid from the queue when it completes
@@ -383,12 +398,13 @@ sub waitforcommand {
                 }
             }
             close(WAITREAD);
-            unlink($qout);
             if ($jobstate eq 'C') {
+                unlink($qout) or warn "Could not remove $qout\n";
                 warn "Batch job '$jobid' was cancelled\n";
                 return 98;
             }
         }
+        unlink($qout) or warn "Could not remove $qout\n";
         $opts{waittries} += 12;
         if ($opts{waittries} > $opts{maxwaittries}) { $opts{waittries} = $opts{maxwaittries}; }
         if ($opts{verbose}) { print "Next pass waittries=$opts{waittries}\n"; }

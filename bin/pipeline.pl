@@ -37,6 +37,9 @@ push @INC,$scriptdir;                   # Use lib is a BEGIN block and does not 
 #   Global Variables
 ############################################################################
 
+# Track if any of the "bams" are crams.
+my %isCram = ();
+
 #--------------------------------------------------------------
 #   Initialization - Sort out the options and parameters
 #--------------------------------------------------------------
@@ -52,6 +55,7 @@ my %opts = (
     verbose => 0,
     maxlocaljobs => 10,
     ignoreSmCheck => '',
+    ignoreRefChrCheck => '',
 );
 Getopt::Long::GetOptions( \%opts,qw(
     help
@@ -71,8 +75,9 @@ Getopt::Long::GetOptions( \%opts,qw(
     keeptmp
     keeplog
     ignoreSmCheck
+    ignoreRefChrCheck
     verbose=i
-    numjobs|numjobs=i
+    numjobs|num_jobs=i
     maxlocaljobs=i
     gotcloudroot|gcroot=s
     region=s
@@ -129,8 +134,8 @@ push(@confSettings, "GOTCLOUD_ROOT = $gotcloudRoot");
 #   Check if we are running the test case.
 #--------------------------------------------------------------
 if ($opts {test}) {
-    # remove a trailing slash if there is one.
-    $opts{test} =~ s/\/\z//;
+    # remove any trailing slashes.
+    $opts{test} =~ s/\/+\z//;
     my $outdir=abs_path($opts{test});
     system("mkdir -p $outdir") &&
         die "Unable to create directory '$outdir'\n";
@@ -169,7 +174,7 @@ if ($opts {test}) {
 #############################################################################
 if(!$opts{runcluster})
 {
-    $opts{runcluster} = "$gotcloudRoot/scripts/runcluster.pl",
+    $opts{runcluster} = "$gotcloudRoot/scripts/runcluster.pl";
 }
 $opts{runcluster} = abs_path($opts{runcluster});    # Make sure this is fully qualified
 
@@ -191,8 +196,7 @@ if($opts{conf})
 {
     if (! -r $opts{conf})
     {
-        my $usage;
-        $usage .= "Conf file '$opts{conf}' does not exist or was not specified\n";
+        warn "Conf file '$opts{conf}' can't be accessed.\n";
     }
     $opts{conf} = abs_path($opts{conf});
 }
@@ -201,8 +205,8 @@ if($opts{conf})
 #   Set configuration variables from comand line options
 #############################################################################
 if ($opts{out_dir}) {
-    # remove a trailing slash if there is one.
-    $opts{out_dir} =~ s/\/\z//;
+    # remove any trailing slashes.
+    $opts{out_dir} =~ s/\/+\z//;
     my $outdir = abs_path($opts{out_dir});
     system("mkdir -p $outdir") &&
         die "Unable to create directory '$outdir'\n";
@@ -236,14 +240,22 @@ if (loadConf(\@confSettings, \@configs, $opts{verbose})) {
     die "Failed to read configuration files\n";
 }
 
+#--------------------------------------------------------------
+#   Check pipeline name setting
+#--------------------------------------------------------------
+if((!defined $opts{name}) || ($opts{name} eq ""))
+{
+    die "ERROR: '--name' is required, but not set.\n";
+}
+
 #-------------
 # Handle cluster setup.
 # Pull batch info from config if not on command line.
 if ((!defined $opts{batchopts}) || ( $opts{batchopts} eq "" )) {
-    $opts{batchopts} = getConf("BATCH_OPTS");
+    $opts{batchopts} = getStepConf($opts{name},"BATCH_OPTS");
 }
 if ((!defined $opts{batchtype}) || ( $opts{batchtype} eq "" )) {
-    $opts{batchtype} = getConf("BATCH_TYPE");
+    $opts{batchtype} = getStepConf($opts{name},"BATCH_TYPE");
 }
 if ((!defined $opts{batchtype}) || ($opts{batchtype} eq ""))
 {
@@ -256,17 +268,25 @@ if ($opts{batchtype} eq 'flux') { $opts{batchtype} = 'pbs'; }
 #--------------------------------------------------------------
 if(!$opts{ignoreSmCheck})
 {
-    $opts{ignoreSmCheck} = getConf("IGNORE_SM_CHECK");
+    $opts{ignoreSmCheck} = getStepConf($opts{name}, "IGNORE_SM_CHECK");
 }
+
+if(!$opts{ignoreRefChrCheck})
+{
+    $opts{ignoreRefChrCheck} = getStepConf($opts{name}, "IGNORE_REF_CHR_CHECK");
+}
+my $outdir = getStepConf($opts{name},"OUT_DIR");
+unless ( $outdir =~ /^\// ) {
+    $outdir = getcwd()."/".$outdir;
+    setConf("$opts{name}/OUT_DIR", $outdir);
+}
+setConf("OUT_DIR", $outdir);
+
+
 
 #--------------------------------------------------------------
 #   Check required settings
 #--------------------------------------------------------------
-
-if((!defined $opts{name}) || ($opts{name} eq ""))
-{
-    die "ERROR: '--name' is required, but not set.\n";
-}
 
 my $failReqFile = "0";
 my %deprecatedWarn = (
@@ -275,17 +295,18 @@ my %deprecatedWarn = (
 
 foreach my $key (keys %deprecatedWarn)
 {
-    if(getConf("$key"))
+    if(getStepConf($opts{name}, "$key"))
     {
         warn "WARNING: '$key' is deprecated and has been replaced by '$deprecatedWarn{$key}'\n";
     }
 }
 
-if(!getConf("BAM_LIST"))
+if(!getStepConf($opts{name}, "BAM_LIST"))
 {
-    if(getConf("BAM_INDEX"))
+    if(getStepConf($opts{name}, "BAM_INDEX"))
     {
-        setConf("BAM_LIST", getConf("BAM_INDEX"));
+        setConf("$opts{name}/BAM_LIST", getStepConf($opts{name}, "BAM_INDEX"));
+        setConf("BAM_LIST", getStepConf($opts{name}, "BAM_INDEX"));
     }
     else
     {
@@ -299,7 +320,8 @@ if($failReqFile eq "1")
     die "Exiting pipeline due to required file(s) missing\n";
 }
 
-my $newpath = getAbsPath(getConf("REF"), "REF");
+my $newpath = getAbsPath(getStepConf($opts{name},"REF"), "REF");
+setConf("$opts{name}/REF", $newpath);
 setConf("REF", $newpath);
 
 # TODO check for file existence
@@ -308,7 +330,7 @@ setConf("REF", $newpath);
 #############################################################################
 ## STEP  : Parse BAM LIST FILE
 ############################################################################
-my $bamList = getAbsPath(getConf("BAM_LIST"));
+my $bamList = getAbsPath(getStepConf($opts{name},"BAM_LIST"));
 my %sample2bams = ();  # hash mapping sample IDs to bams
 my %sample2SingleBam = ();  # hash mapping sample IDs to a single per sample bam
 my %bam2sample = ();  # hash mapping bams to sample IDs
@@ -337,9 +359,9 @@ while (<LIST>)
         }
 
         # Population is optional, so check pop to see if it looks like a BAM/CRAM.
-        if($pop =~ /(bam|BAM|cram|CRAM)$/)
+        if($pop =~ /(bam|cram)$/i)
         {
-            # No population, just a BAM/CRAM, add it to the list of bams, and 
+            # No population, just a BAM/CRAM, add it to the list of bams, and
             # set population to ALL.
             unshift(@bams,$pop);
             $pop = "ALL";
@@ -347,17 +369,17 @@ while (<LIST>)
         }
         elsif(scalar @bams == 0)
         {
-            die "ERROR: Check the format of $bamList.  It should be at least 3 columns (sample, population, bams), or if population is skipped, the bams/crams in the 2nd column should end in 'bam', 'BAM', 'cram', or 'CRAM'.\n";
+            die "ERROR: Check the format of $bamList.  It should be at least 3 columns (sample, population, bams), or if population is skipped, the bams/crams in the 2nd column should end in 'bam' or 'cram'.\n";
         }
 
         # Make sure the sample id & population don't look like bam file names.
-        if($sampleID =~ /(bam|BAM|cram|CRAM)$/)
+        if($sampleID =~ /(bam|cram)$/i)
         {
             die "ERROR: Check the format of $bamList.\nFirst column should be the sample name, but it looks like a bam file.\n\tExample: $sampleID\n";
         }
         if($pop =~ /\.bam$/)
         {
-            die "ERROR: Check the format of $bamList.\nSecond column should be the population, but it looks like a bam file.\n\tExample: $pop\n";
+            die "ERROR: Check the format of $bamList.\nSecond of three columns should be the population, but it looks like a bam file.\n\tExample: $pop\n";
         }
 
         # Check if the sample already exists.
@@ -374,7 +396,7 @@ while (<LIST>)
             while($bam =~ /\$\(([^\s)]+)\)/ )
             {
                 my $key = $1;
-                my $val = getConf($key);
+                my $val = getStepConf($opts{name},$key);
                 $bam =~ s/\$\($key\)/$val/;
             }
 
@@ -417,7 +439,7 @@ if(scalar keys %bam2sample == 0)
 
 my $numSamples = scalar @samplesArray;
 
-if(($noPop ne 0) && ($noPop ne $numSamples))
+if(($noPop != 0) && ($noPop != $numSamples))
 {
     die "ERROR: All entries in BAM_LIST, $bamList, must consistently either have a population column or not have a population column.  It cannot be mixed.\n";
 }
@@ -426,11 +448,11 @@ if(($noPop ne 0) && ($noPop ne $numSamples))
 ## STEP 4 : Read FASTA INDEX file to determine chromosome size
 ############################################################################
 my %hChrSizes = ();
-my $ref = getConf("REF");
+my $ref = getStepConf($opts{name},"REF");
 my $fai = $ref.".fai";
-if(getConf("REF_FAI"))
+if(getStepConf($opts{name},"REF_FAI"))
 {
-    $fai = getConf("REF_FAI");
+    $fai = getStepConf($opts{name},"REF_FAI");
 }
 
 open(IN,$fai) || die "Cannot open $fai file for reading";
@@ -443,7 +465,7 @@ close IN;
 # TODO
 my ($callstart,$callend);
 if ( $opts{region} ) {
-    if ( $opts{region} =~ /^([^:]+):(\d+)(\-\d+)?$/ ) {
+    if ( $opts{region} =~ /^([^:]+):(\d+)(-\d+)?$/ ) {
 # TODO - set CHRS to $1        @chrs = ($1);
         $callstart = $2;
         $callend = $3 ? substr($3,1) : $hChrSizes{$1};
@@ -458,8 +480,8 @@ if ( $opts{region} ) {
 ############################################################################
 # PARSE TARGET INFORMATION if specified
 ############################################################################
-my $multiTargetMap = getConf("MULTIPLE_TARGET_MAP");
-my $uniformTargetBed = getConf("UNIFORM_TARGET_BED");
+my $multiTargetMap = getStepConf($opts{name},"MULTIPLE_TARGET_MAP");
+my $uniformTargetBed = getStepConf($opts{name},"UNIFORM_TARGET_BED");
 
 
 my %hBedIndices = ();
@@ -507,7 +529,7 @@ elsif ( $multiTargetMap ne "" ) {
 }
 
 foreach my $bed (@uniqBeds) {
-    my $r = parseTarget($bed,getConf("OFFSET_OFF_TARGET"));
+    my $r = parseTarget($bed,getStepConf($opts{name},"OFFSET_OFF_TARGET"));
     push(@targetIntervals,$r);
 }
 
@@ -533,7 +555,7 @@ foreach my $step (@steps)
 
 my %regions = ();
 
-my @chrs = split(/\s+/,getConf("CHRS"));
+my @chrs = split(/\s+/,getStepConf($opts{name},"CHRS"));
 my $unitChunk = getStepConf($opts{name},"UNIT_CHUNK");
 
 # Only need to set the chromsomes and regions if $byChr is set.
@@ -619,6 +641,33 @@ for my $bam (sort keys %bam2sample)
     read(BAM, $buffer, 4);
     if($buffer ne "BAM\1")
     {
+        # Check if it is a CRAM file.
+        if($buffer eq "CRAM")
+        {
+            # This bam is a cram.
+            $isCram{$bam} = 1;
+            if(getStepConf($opts{name},"NO_CRAM") &&
+               getStepConf($opts{name},"NO_CRAM") ne 0)
+            {
+                die "ERROR: $bam is a CRAM file, but the '$opts{name}' pipeline does not support CRAM.\n";
+            }
+
+            # Read the header to get the chromosome names.
+            open my $input, "-|", getConf("SAMTOOLS_EXE")." view -H $bam | grep \"^\@SQ\""
+            or die "samtools failed to read header from $bam: $!";
+            while(my $line = <$input>)
+            {
+                chomp $line;
+                $line =~ /M5:([0-9a-fA-F]*)/;
+                my $m5 = $1;
+                $line =~ /SN:([^\t]*)/;
+                $bamChrs{$bam}{$1} = 1;
+              #  $refM5s{$m5} = $1;
+            }
+            close $input;
+            # TODO, validate CRAM.
+            next;
+        }
         #use bytes;
         #printf '%02x ', ord substr $buffer, 3, 1;
         die "$bam is not a proper BAM file, magic != BAM\\1, instead it is ".$buffer."\n";
@@ -674,15 +723,10 @@ for my $bam (sort keys %bam2sample)
 #############################################################################
 ## Create MAKEFILE
 ############################################################################
-my $outdir = getConf("OUT_DIR");
-unless ( $outdir =~ /^\// ) {
-    $outdir = getcwd()."/".$outdir;
-    setConf('OUT_DIR', $outdir);
-}
 
 system("mkdir -p $outdir") &&
 die "Unable to create directory '$outdir'\n";
-my $makeBase = "$outdir/".getConf("MAKE_BASE_NAME_PIPE").".$opts{name}";
+my $makeBase = "$outdir/".getStepConf($opts{name},"MAKE_BASE_NAME_PIPE").".$opts{name}";
 dumpConf("$makeBase.conf");
 my $makef = "$makeBase.Makefile";
 
@@ -748,7 +792,7 @@ my %numBamWarn = ();
 for my $bam (sort keys %bam2sample)
 {
     # Validate all BAM chromosomes are in the reference.
-    if($allBamChr)
+    if($allBamChr && !$opts{ignoreRefChrCheck})
     {
         # all chromosomes in the BAMs must be in the reference.
         foreach my $chr (sort(keys %{$bamChrs{$bam}}))
@@ -773,7 +817,7 @@ for my $bam (sort keys %bam2sample)
     if($needbai)
     {
         # Only if breaking up by chromosome, check that all of the
-        #  chromosomes in CHRS are in the BAM.
+        #  chromosomes in CHRS are in the BAM/CRAM.
         if($byChr == 1)
         {
             foreach my $chr (@chrs)
@@ -805,12 +849,22 @@ for my $bam (sort keys %bam2sample)
             }
         }
 
-        # Validate the BAI files.
-        my $bai = "$bam.bai";
-        my $bai2 = $bam;
-        $bai2 =~ s/\.bam$/.bai/;
-        unless ( -r $bai || -r $bai2 ) { die "ERROR: Cannot read .bai file, '$bai'\n"; }
-        unless ( -s $bai || -s $bai2 ) { die "ERROR: $bai' is empty.\n"; }
+        if(exists $isCram{$bam})
+        {
+            # Cram - die if cram index is not readable
+            my $crai = "$bam.crai";
+            unless ( -r $crai ) { die "ERROR: Cannot read CRAM.crai file, '$crai'\n"; }
+            unless ( -s $crai ) { die "ERROR: $crai' is empty.\n"; }
+        }
+        else
+        {
+            # Validate the BAI files.
+            my $bai = "$bam.bai";
+            my $bai2 = $bam;
+            $bai2 =~ s/\.bam$/.bai/;
+            unless ( -r $bai || -r $bai2 ) { die "ERROR: Cannot read .bai file, '$bai'\n"; }
+            unless ( -s $bai || -s $bai2 ) { die "ERROR: $bai' is empty.\n"; }
+        }
     }
 }
 
@@ -869,7 +923,7 @@ print STDERR "Finished creating makefile $makef\n\n";
 
 my $rc = 0;
 if($opts{numjobs} && ($opts{numjobs} != 0)) {
-    my $cmd = "make -k -f $makef -j $opts{numjobs} ". getConf("MAKE_OPTS") . " > $makef.log";
+    my $cmd = "make -k -f $makef -j $opts{numjobs} ". getStepConf($opts{name},"MAKE_OPTS") . " > $makef.log";
     if(($opts{batchtype} eq 'local') && ($opts{numjobs} > $opts{maxlocaljobs}))
     {
         die "ERROR: can't run $opts{numjobs} jobs with 'BATCH_TYPE = local', " .
@@ -895,8 +949,8 @@ if($opts{numjobs} && ($opts{numjobs} != 0)) {
     #    die "Makefile, $makef failed d=$cmd\n";
 }
 else {
-    print STDERR "Try 'make -f $makef ". getConf("MAKE_OPTS") . " -n | less' for a sanity check before running\n";
-    print STDERR "Run 'make -k -f $makef ". getConf("MAKE_OPTS") . " -j [#parallele jobs]'\n";
+    print STDERR "Try 'make -f $makef ". getStepConf($opts{name},"MAKE_OPTS") . " -n | less' for a sanity check before running\n";
+    print STDERR "Run 'make -k -f $makef ". getStepConf($opts{name},"MAKE_OPTS") . " -j [#parallele jobs]'\n";
 }
 print STDERR "--------------------------------------------------------------------\n";
 
@@ -1022,7 +1076,9 @@ sub processTarget
         my $output = resolveTmp(getStepInfo($step,"OUTPUT"));
         # Write the Makefile Target for this step.
         writeTarget($output, $makeDepends,
-                    resolveTmp(getStepInfo($step, "CMD")));
+                    resolveTmp(getStepInfo($step, "CMD")),
+                    getStepConf($step, "LOCAL"));
+
         $stepTargets .= " ".$output.".OK";
 
         # if we are generating a file containing the outputs, write to it.
@@ -1187,7 +1243,14 @@ sub getStepType
     if(hasTmpKey($output, "CHR"))    { $outputtype .= "PerChr";}
     if(hasTmpKey($output, "START"))  { $outputtype .= "PerRegion"; }
 
-# TODO check for any other tmp keys - invalid.
+    # Check for invalid tmp keys
+    my %validTmpKeys = map {$_ => 1} qw{BAM SAMPLE CHR START END INPUT};
+    for my $observedTmpKey ($output =~ m/\?\((.*?)\)/g) {
+        if ( ! exists $validTmpKeys{$observedTmpKey} and ($observedTmpKey !~ m/OUTPUT/)) {
+            warn "illegal tmp key '$observedTmpKey' in step '$step'.";
+        }
+    }
+
     # Check for valid types - can't have PerRegion without PerChr.
     die "ERROR, can't have a PerRegion type without PerChr\n" if(($outputtype =~ /PerRegion/) && ($outputtype !~ /PerChr/));
     return($outputtype);
@@ -1351,11 +1414,11 @@ sub setStepInfo
 ###############################################################
 
 #--------------------------------------------------------------
-#   writeTarget(step)
+#   writeTarget()
 #
 #--------------------------------------------------------------
 sub writeTarget {
-    my ($output, $depend, $cmd) = @_;
+    my ($output, $depend, $cmd, $local) = @_;
 
     my $okExt = "OK";
 
@@ -1369,14 +1432,21 @@ sub writeTarget {
         $allDirs{$dir} = undef;
     }
 
-    $cmd =~ s/'/"/g;            # Avoid issues with single quotes in command
-    my $newcmd = $opts{runcluster}." ";
-    if($opts{batchopts})
+    my $newcmd;
+    if(defined $local && $local ne "" && $local ne "0" )
     {
-        $newcmd .= "-opts '".$opts{batchopts}."' ";
+        $newcmd = $cmd;
     }
-    $newcmd .= "$opts{batchtype} '$cmd'";
-
+    else
+    {
+        $cmd =~ s/'/"/g;            # Avoid issues with single quotes in command
+        $newcmd = $opts{runcluster}." -bashdir $outdir/jobfiles ";
+        if($opts{batchopts})
+        {
+            $newcmd .= "-opts '".$opts{batchopts}."' ";
+        }
+        $newcmd .= "$opts{batchtype} '$cmd'";
+    }
 
     writeMake("$output.$okExt:${depend}${dirDep}");
     writeMake("\n\t$newcmd\n");
@@ -1407,7 +1477,7 @@ sub isBamMakeDepend {
 
     my $tmpVal = getStepConf($step, "BAM_DEPEND");
     if ((($tmpVal ne '') && ($tmpVal eq "TRUE")) ||
-        (($tmpVal eq '') && (getConf("BAM_DEPEND") eq "TRUE")))
+        (($tmpVal eq '') && (getStepConf($opts{name},"BAM_DEPEND") eq "TRUE")))
     {
         return(1);
     }
